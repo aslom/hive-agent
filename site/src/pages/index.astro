@@ -1,0 +1,18 @@
+---
+import { getCollection } from "astro:content";
+import BaseLayout from "../layouts/BaseLayout.astro";
+import MonthView from "../components/MonthView.astro";
+import { groupByMonth, buildMonthList } from "../scripts/months";
+
+const issues = await getCollection("issues");
+const buckets = groupByMonth(issues);
+const months = buildMonthList(buckets);
+const latest = buckets[0];
+---
+<BaseLayout title="AI Agents Daily">
+  {latest === undefined ? (
+    <p class="empty-state">No issues yet. The first run lands tomorrow.</p>
+  ) : (
+    <MonthView issues={latest.issues} months={months} currentMonth={latest.key} />
+  )}
+</BaseLayout>

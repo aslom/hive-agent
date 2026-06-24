@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+logs/
+candidates.json
+ranked.json
+.rubric_hash
+.claude/settings.local.json
+
+# Astro
+site/node_modules/
+site/dist/
+site/.astro/
