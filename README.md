@@ -101,6 +101,20 @@ To uninstall the schedulers:
 ./launchd/install.sh --uninstall
 ```
 
+## Running tests
+
+The repository ships a pure-Python `unittest` suite that covers the deterministic
+core logic (URL canonicalization, recency gate, near-duplicate collapse, ranking
+cap/status, and prompt construction). No LLM credentials or network access are
+required.
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+The same command runs automatically on every push and pull request via
+`.github/workflows/tests.yml`.
+
 ## Cost & runtime
 
 A typical run takes ~10 minutes wall time, most of it the three ranker LLM calls plus the one writer call. Cost depends entirely on which models you point `RANKER_MODEL` / `WRITER_MODEL` at. Per-run cost is logged in the `runs` table.
