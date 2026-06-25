@@ -20,6 +20,7 @@ scripts/
   llm.py                — thin wrapper around OpenAI-compatible chat-completions
   publish.py            — promotes items to 'published'; records runs row
   db.py                 — schema, URL canonicalization
+  backfill.py           — recover a missed day's newsletter from the candidate pool snapshot
 run.sh                  — daily orchestrator; idempotent
 watchdog.sh             — fires macOS notification if no commit in >36h
 launchd/                — plists + install.sh for the two daily/hourly jobs

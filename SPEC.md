@@ -35,23 +35,23 @@ Explicitly down-weighted: consumer AI hype, funding announcements, VC takes, "pr
   └──────┬───────┘
          │ invokes
          ▼
-  ┌──────────────────────────────────────────────┐
-  │  run.sh                                      │
-  │    1. python fetch.py      (deterministic)   │
-  │    2. python prefilter.py  (deterministic)   │
-  │    3. claude -p "rank..."  (LLM, via CC)     │
-  │    4. claude -p "summarize & write..." (CC)  │
-  │    5. python publish.py    (deterministic)   │
-  │    6. git add / commit / push                │
-  └──────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────┐
+  │  run.sh                                                │
+  │    1. python fetch.py      (deterministic)             │
+  │    2. python prefilter.py  (deterministic)             │
+  │    3. python rank.py       (LLM via OpenAI-compat API) │
+  │    4. python write.py      (LLM via OpenAI-compat API) │
+  │    5. python publish.py    (deterministic)             │
+  │    6. git add / commit / push                          │
+  └────────────────────────────────────────────────────────┘
          │              │
          ▼              ▼
-    state.db       newsletters/YYYY-MM-DD.md
-    (SQLite,       + index.md (for Pages)
+    state.db       site/src/content/issues/YYYY-MM-DD.md
+    (SQLite,
      committed)
 ```
 
-Claude Code is invoked twice in headless mode (`claude -p`) for the two tasks that need judgment: ranking and summarizing. Everything else is plain Python.
+`rank.py` and `write.py` call an OpenAI-compatible chat-completions endpoint directly (via `scripts/llm.py`). Everything else is plain Python.
 
 ## Components
 
@@ -69,11 +69,9 @@ Pure Python, no LLM calls. Pulls from:
 |---------------|------------------------------------|---------------------------------------------------------------------------------------------|
 | RSS/Atom      | `feedparser`                       | Simon Willison, Latent Space, Anthropic blog, LangChain, HuggingFace, Sebastian Raschka... |
 | arXiv         | arXiv API (Atom)                   | Queries on `cs.AI`, `cs.CL`, `cs.SE` with agent-related terms, last 48h                    |
-| Semantic Schl | REST API                           | Backfill citation counts on arxiv hits                                                     |
 | HN            | Algolia API                        | `query=agent OR LLM`, min points threshold, last 48h                                       |
 | Reddit        | `.json` endpoints                  | `r/LocalLLaMA`, `r/MachineLearning`, min upvotes                                           |
-| GitHub        | `gh api` via subprocess            | Trending repos tagged `ai-agents`/`llm-agent`; releases from a watchlist                   |
-| HF Daily      | Scrape HTML of daily-papers page   | Pre-curated academic signal                                                                |
+| GitHub        | `gh api` via subprocess            | Releases from a configured watchlist (LangGraph, CrewAI, AutoGen, etc.)                    |
 
 Feed list lives in `sources.yaml` — easy to edit without touching code.
 
@@ -97,18 +95,15 @@ Rules (all configurable in `scripts/prefilter.py`):
 
 Survivors get `status = 'candidate'`.
 
-### 4. Ranker — Claude Code (headless)
+### 4. Ranker — `scripts/rank.py`
 
-```bash
-claude -p "$(cat prompts/rank.md)" --output-format=json > ranked.json
-```
+`rank.py` reads `candidates.json` (written by `prefilter.py`) and invokes an OpenAI-compatible LLM endpoint via `scripts/llm.py` — one call per section (`papers`, `news`, `blogs`). Each call receives the section's candidates as JSON inline in the prompt, along with the rubric from `prompts/rank.md`, and returns a structured JSON response validated against a schema.
 
-`prompts/rank.md` instructs CC to:
-1. Read `candidates.json`, which contains items already grouped by section (`papers`, `news`, `blogs`) by `prefilter.py`.
-2. Score each item 1-10 against the rubric below, applying the **section-specific** axis emphasis and threshold.
-3. Return a JSON array: `[{id, score, tags, one_line_why}]`. Section is not emitted — it was set deterministically upstream.
+`prompts/rank.md` instructs the ranker to:
+1. Score each item 1-10 against the rubric below, applying the **section-specific** axis emphasis and threshold.
+2. Return a JSON object `{"rankings": [{id, score, tags, why}]}`. Section is not emitted — it was set deterministically upstream.
 
-The ranker is invoked with all three buckets in a single call so it has cross-section context (e.g., it can see that today is paper-heavy and hold the bar higher), but it scores each item against its own section's rubric.
+The ranker invokes one LLM call per section (not one big call for all three) so each call stays within a reasonable token budget and can be retried independently.
 
 **Ranking rubric** (codified in the prompt):
 
@@ -146,34 +141,32 @@ Also emit:
 
 Writes scores, tags, and section back to `state.db`, sets `status = 'ranked'`.
 
-### 5. Summarizer / Writer — Claude Code (headless)
+### 5. Summarizer / Writer — `scripts/write.py`
 
-```bash
-claude -p "$(cat prompts/write.md)" > newsletters/$(date +%F).md
-```
+`write.py` reads the day's `featured` and `appendix` items from `state.db`, calls an OpenAI-compatible LLM via `scripts/llm.py` with the rubric from `prompts/write.md`, and assembles the result into `site/src/content/issues/YYYY-MM-DD.md`.
 
-The prompt gives CC:
-- The top ~8-12 featured items (id, url, title, abstract, source, tags, one_line_why).
+The LLM receives:
+- The top ~8-12 featured items (id, url, title, abstract, source, tags, why).
 - The appendix list (title + url only).
 - A style guide (see below) and yesterday's newsletter for continuity/tone calibration.
 
-CC writes:
-1. **Header** — date, 1-2 sentence "today's theme" if one emerges, else skip.
-2. **Featured items, grouped into three top-level sections** in this fixed order:
-   1. **Papers** — academic preprints and peer-reviewed work. Items where `source` starts with `arxiv:` or `hf-daily:`. Lead with the contribution, not the title's vocabulary. If the methodology is weak (no baseline, n=1, cherry-picked task), say so.
-   2. **News** — releases, launches, incidents, deprecations, vendor announcements. Items where `source` starts with `gh:` (releases), or content from RSS/HN/Reddit that is announcement-shaped (release notes, "we launched X", incident postmortems). Prioritize items with concrete version numbers, deprecation dates, or breaking changes.
-   3. **Blogs** — practitioner writeups, deep dives, tutorials, opinion. Items from RSS feeds (Simon Willison, Latent Space, Interconnects, etc.) and HN/Reddit discussions of practitioner posts. This is where the editorial voice should be sharpest.
+The LLM returns **only editorial prose** — theme, per-item summaries, optional takeaway/open_question callouts. All structured data (URLs, titles, scores, tags, appendix list) is assembled by `write.py` from `state.db` and written verbatim into YAML frontmatter. This makes URL hallucination mechanically impossible: the LLM never sets a URL.
 
-   Each item within a section:
-   - Title as link.
-   - Source and author.
-   - 2-4 sentence summary with a "why it matters" framing.
-   - Optional "⚠ open question" or "💡 takeaway" line when warranted.
+The output file is consumed by the Astro 5 site (in `site/`) and deployed to GitHub Pages on push. Astro's content-collection schema validates the frontmatter at build time as a second line of defense.
 
-   If a section has zero featured items on a given day, omit the section header — don't print "## Papers" with nothing under it.
+The writer output structure:
+The LLM returns a JSON object:
+- `theme` — optional 1-2 sentence "today's theme" if a cross-item thread emerges, else null.
+- `items` — array of per-featured-item objects: `{id, summary, takeaway, open_question}`.
 
-3. **Appendix** — single bulleted list `[Title](url) — source` for uncertain items, regardless of section. No summaries.
-4. **Footer** — run metadata (items considered, items featured per section, LLM cost if available).
+`write.py` splices these prose fields with the structured data from `state.db` into YAML frontmatter, then writes `site/src/content/issues/YYYY-MM-DD.md`. The Astro template renders the final layout (sections, links, appendix) from the frontmatter. If a section has zero featured items on a given day, the template omits that section header.
+
+**Per-item prose guidelines** (embedded in the writer prompt):
+- 2-4 sentence summary with a "why it matters" framing, max 80 words.
+- Optional `takeaway` (`💡`) or `open_question` (`⚠`) — at most one per item; both null is fine.
+- Papers: lead with the contribution, not the title's vocabulary; name specific weaknesses if present.
+- News: prioritize concrete version numbers, deprecation dates, or breaking changes.
+- Blogs: this is where the editorial voice should be sharpest.
 
 **Section assignment** is done deterministically in `prefilter.py` based on the source family — *before* the ranker runs. The ranker then receives three already-bucketed candidate lists and ranks each independently. No LLM judgment on which bucket an item belongs to; the source decides.
 
@@ -205,11 +198,11 @@ Style guide (embedded in the prompt):
 
 ### 6. Publisher — `publish.py`
 
+- Verifies the issue file exists at `site/src/content/issues/YYYY-MM-DD.md` and is non-trivial (size and featured-item count gates).
 - Marks featured/appendix items `status = 'published'` in DB.
-- Regenerates `index.md` (reverse-chronological list of all newsletters with first-line excerpt).
-- Updates `feed.xml` (Atom) if we add it later.
-- `git add newsletters/ state.db index.md && git commit && git push`.
-- GitHub Pages serves from the repo — no build step needed (Jekyll renders MD).
+- Records a row in the `runs` table (item counts by section, appendix count, cost fields).
+- `run.sh` then stages `site/src/content/issues/` and `state.db`, commits, and pushes to `main`.
+- GitHub Actions triggers the Astro build on push, which validates YAML frontmatter and deploys to GitHub Pages.
 
 ## Dedup Strategy
 
@@ -294,7 +287,6 @@ CREATE TABLE topics_covered (  -- for cross-day topic dedup
 ## Repo Layout
 
 ```
-incubation/
 ├── SPEC.md                    ← this file
 ├── README.md
 ├── run.sh                     ← entry point (pipeline)
@@ -304,18 +296,20 @@ incubation/
 │   ├── rank.md
 │   └── write.md
 ├── scripts/
-│   ├── fetch.py
-│   ├── prefilter.py
-│   ├── publish.py
-│   └── cost.py                ← parse CC session output → runs.cost_usd
-├── newsletters/
-│   ├── 2026-05-13.md
-│   └── ...
-├── state.db                   ← committed
-├── index.md                   ← for GitHub Pages
+│   ├── fetch.py               ← collectors (no LLM)
+│   ├── prefilter.py           ← recency + keyword + dedup gates
+│   ├── rank.py                ← LLM ranker (OpenAI-compatible)
+│   ├── write.py               ← LLM writer (OpenAI-compatible)
+│   ├── publish.py             ← promotes items, records runs row
+│   ├── llm.py                 ← thin OpenAI-compatible API wrapper
+│   ├── db.py                  ← schema, URL canonicalization
+│   └── backfill.py            ← recover a missed day from the candidate pool
+├── site/                      ← Astro 5 static site
+│   └── src/content/issues/    ← one YYYY-MM-DD.md per issue
+├── state.db                   ← committed (audit log)
+├── launchd/                   ← plists + install.sh for daily + hourly jobs
 ├── logs/
-└── tests/
-    └── test_dedup.py
+└── .rubric_hash               ← hash of prompts/rank.md for cache invalidation
 ```
 
 ## Failure Modes & Mitigations
@@ -323,10 +317,10 @@ incubation/
 | Failure                           | Mitigation                                                   |
 |-----------------------------------|--------------------------------------------------------------|
 | A feed is down                    | Per-source try/except; log and continue; skip source for day |
-| CC session times out / crashes    | Stage exits nonzero; `run.sh` aborts; macOS notification fires; re-run is idempotent |
-| CC produces malformed JSON        | `rank.py` validates with jsonschema; on fail, retry with stricter prompt, then fall back to score-by-source-reputation |
-| CC hallucinates a URL             | Summarizer prompt only sees items+URLs from the DB; publish.py verifies every linked URL in output exists in DB |
-| SQLite merge conflict (unlikely)  | Single writer (your Mac); but add `busy_timeout` anyway      |
+| LLM call times out / crashes      | Stage exits nonzero; `run.sh` aborts; macOS notification fires; re-run is idempotent |
+| LLM returns malformed JSON        | `llm.py` retries up to `max_attempts=2`; on all failures the stage exits nonzero |
+| LLM hallucinates a URL            | `write.py` never asks the LLM for URLs — all URLs are spliced from `state.db` into the YAML frontmatter; hallucination is mechanically impossible |
+| SQLite merge conflict (unlikely)  | Single writer (your Mac); `busy_timeout=10s` in `db.connect()` |
 | Newsletter is empty / too short   | Gate in publish.py: if file is below MIN_FILE_SIZE_BYTES or 0 featured + 0 appendix, refuse to publish (nonzero exit) |
 | Cost runaway                      | Per-run cost recorded in `runs.cost_usd`; `BUDGET_USD` env var scaffolded but not enforced in v1 (see Cost Budget) |
 | No commit in >36h                 | Separate "watchdog" launchd job runs hourly; if `git log -1` is stale, fires a macOS notification |
@@ -345,7 +339,7 @@ macOS notifications via `osascript`. No email, no SMTP, no third-party service:
 v1 records cost; v2 enforces it. Scaffolding now so we don't have to retrofit:
 
 - `runs` table includes `cost_usd REAL` and `tokens_in`, `tokens_out` columns.
-- `claude -p` invocations capture cost from CC's session output (or, if not directly available, estimate from tokens). Helper `scripts/cost.py` parses and writes to the DB.
+- `llm.py` logs token usage from each API response (`prompt_tokens`, `completion_tokens`). Cost population into `runs.cost_usd` is scaffolded but not yet wired (the column is present; the update is not yet implemented in `publish.py`).
 - `BUDGET_USD` env var is read at the top of `run.sh` and logged. **Not enforced** in v1 — just observed.
 - A weekly summary line in the log: "last 7 days: $X.YY". Once we have ~30 days of data we'll set a real cap.
 
@@ -405,10 +399,9 @@ The operator-supplied seed list, to be fleshed out with concrete feed URLs durin
 
 Non-obvious things discovered during real runs that future-you should know without rediscovering them.
 
-### Anthropic API + Claude Code headless
+### OpenAI-compatible structured output
 
-- `claude -p --json-schema '<schema>'` requires the schema's **top-level type to be `object`**, not `array`. Wrap arrays in `{"items": [...]}`.
-- With `--json-schema`, the model's structured output lands in the envelope's `structured_output` field. The plain `result` field is empty in that mode. Code that reads `result` will fail mysteriously; always check `structured_output` first.
+- Use `response_format={"type": "json_schema", "json_schema": {"name": ..., "schema": ..., "strict": true}}`. The top-level schema type **must be `object`**, not `array` — wrap arrays in `{"rankings": [...]}` or `{"items": [...]}`.
 - Per-section ranking calls (one per `papers`/`news`/`blogs`) work much better than one big call. ~$0.30-1.20 per section, 3-7 minutes each. A single 150-item call risks timeouts and quality degradation.
 - Writer call ($0.30-0.50) is cheaper than ranker calls because it processes only ~12 featured items, not 100+ candidates.
 - Set `RANKER_TIMEOUT_S=1800` (30 min). 15 min was too tight on chatty news days with verbose release-note `raw_text`. Truncating `raw_text` to ~1500 chars in `write.py` was a measurable cost reducer.
